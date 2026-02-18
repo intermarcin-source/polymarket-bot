@@ -1,0 +1,10 @@
+[Unit]
+Description=Regenerate Polymarket dashboard every 60 seconds
+
+[Timer]
+OnBootSec=10
+OnUnitActiveSec=60
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,29 @@
+[Unit]
+Description=Polymarket Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/polymarket-bot
+Environment=PYTHONUTF8=1
+ExecStart=/opt/polymarket-bot/venv/bin/python main.py --interval 5 --max-cycles 0
+Restart=always
+RestartSec=30
+StartLimitInterval=600
+StartLimitBurst=10
+
+# Logging
+StandardOutput=append:/opt/polymarket-bot/logs/bot_stdout.log
+StandardError=append:/opt/polymarket-bot/logs/bot_stderr.log
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/polymarket-bot/data /opt/polymarket-bot/logs /opt/polymarket-bot
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

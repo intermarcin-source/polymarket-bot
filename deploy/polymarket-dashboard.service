@@ -1,0 +1,15 @@
+[Unit]
+Description=Polymarket Dashboard HTTP Server
+After=network.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/polymarket-bot
+ExecStart=/opt/polymarket-bot/venv/bin/python serve_dashboard.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

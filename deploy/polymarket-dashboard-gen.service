@@ -1,0 +1,9 @@
+[Unit]
+Description=Polymarket Dashboard Generator
+
+[Service]
+Type=oneshot
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/polymarket-bot
+ExecStart=/opt/polymarket-bot/venv/bin/python generate_dashboard.py --no-open
