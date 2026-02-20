@@ -2,6 +2,8 @@
 .env
 *.env
 .env.*
+*.key
+*.pem
 
 # Python
 __pycache__/
@@ -17,11 +19,21 @@ env/
 # Logs and data
 *.log
 logs/
+data/
+
+# Scripts with credentials
+scripts/
+
+# Node
+node_modules/
 
 # IDE
 .vscode/
 .idea/
 *.swp
+
+# Claude project files
+.claude/
 
 # OS
 .DS_Store

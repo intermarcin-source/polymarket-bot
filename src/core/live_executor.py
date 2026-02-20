@@ -31,11 +31,11 @@ DATA_DIR = Path(__file__).parent.parent.parent / "data"
 LIVE_PORTFOLIO_FILE = DATA_DIR / "live_portfolio.json"
 LIVE_TRADES_FILE = DATA_DIR / "live_trades.json"
 
-# Exit thresholds (same as simulator)
-TAKE_PROFIT_PCT = 20.0
-STOP_LOSS_PCT = -25.0
-TRAILING_STOP_PCT = -10.0
-TRAILING_ACTIVATE_PCT = 10.0
+# Exit thresholds — wider for 5-min markets (resolution handles exits)
+TAKE_PROFIT_PCT = 50.0
+STOP_LOSS_PCT = -50.0
+TRAILING_STOP_PCT = -20.0
+TRAILING_ACTIVATE_PCT = 20.0
 
 
 class LiveExecutor:
@@ -44,7 +44,7 @@ class LiveExecutor:
     Interface-compatible with PaperTrader for orchestrator integration.
     """
 
-    def __init__(self, client: PolymarketClient, starting_balance: float = 1695.0):
+    def __init__(self, client: PolymarketClient, starting_balance: float = 0.0):
         self.client = client  # existing read-only client for prices
         self.starting_balance = starting_balance
         self.balance: float = starting_balance
@@ -58,8 +58,21 @@ class LiveExecutor:
         # Initialize CLOB client for order execution
         self.clob_client = self._init_clob_client()
 
-        # Load persisted state
+        # Read actual on-chain USDC.e balance
+        onchain_bal = self._get_onchain_balance()
+        if onchain_bal > 0:
+            self.balance = onchain_bal
+            if self.starting_balance <= 0:
+                self.starting_balance = onchain_bal
+            log.info(f"On-chain USDC.e balance: ${onchain_bal:.2f}")
+
+        # Load persisted state (may override balance if state exists)
         self._load_state()
+
+        # Always sync balance with on-chain if we got a valid reading
+        if onchain_bal > 0:
+            self.balance = onchain_bal
+            self._save_state()
 
     def _init_clob_client(self) -> ClobClient:
         """Initialize the py-clob-client with wallet credentials."""
@@ -71,21 +84,31 @@ class LiveExecutor:
                 signature_type=Config.SIGNATURE_TYPE,
                 funder=Config.FUNDER_ADDRESS,
             )
-            # Derive or load API credentials from private key
             signer_addr = client.get_address()
             log.info(f"CLOB signer address: {signer_addr}")
             log.info(f"CLOB funder address: {Config.FUNDER_ADDRESS}")
             log.info(f"Signature type: {Config.SIGNATURE_TYPE} (0=EOA, 1=POLY_PROXY, 2=GNOSIS)")
 
-            creds = client.create_or_derive_api_creds()
-            if not creds or not getattr(creds, 'api_key', None):
-                raise ValueError(
-                    f"Failed to derive CLOB API credentials. "
-                    f"Signer: {signer_addr}, Funder: {Config.FUNDER_ADDRESS}, "
-                    f"SigType: {Config.SIGNATURE_TYPE}"
+            # Use API credentials from .env if available, otherwise derive them
+            if Config.API_KEY and Config.API_SECRET and Config.API_PASSPHRASE:
+                from py_clob_client.clob_types import ApiCreds
+                creds = ApiCreds(
+                    api_key=Config.API_KEY,
+                    api_secret=Config.API_SECRET,
+                    api_passphrase=Config.API_PASSPHRASE,
                 )
-            client.set_api_creds(creds)
-            log.info(f"CLOB client initialized | API key: {creds.api_key[:8]}... | Funder: {Config.FUNDER_ADDRESS[:10]}...")
+                client.set_api_creds(creds)
+                log.info(f"CLOB client initialized with .env API creds | key: {Config.API_KEY[:8]}... | Funder: {Config.FUNDER_ADDRESS[:10]}...")
+            else:
+                creds = client.create_or_derive_api_creds()
+                if not creds or not getattr(creds, 'api_key', None):
+                    raise ValueError(
+                        f"Failed to derive CLOB API credentials. "
+                        f"Signer: {signer_addr}, Funder: {Config.FUNDER_ADDRESS}, "
+                        f"SigType: {Config.SIGNATURE_TYPE}"
+                    )
+                client.set_api_creds(creds)
+                log.info(f"CLOB client initialized with derived API creds | key: {creds.api_key[:8]}... | Funder: {Config.FUNDER_ADDRESS[:10]}...")
 
             # Set USDC (collateral) allowance so the exchange can spend our funds
             self._set_allowances(client)
@@ -96,13 +119,210 @@ class LiveExecutor:
             raise
 
     def _set_allowances(self, client: ClobClient):
-        """Approve USDC allowance for the Polymarket CTF Exchange."""
+        """Approve USDC allowance for the Polymarket CTF Exchange (on-chain + CLOB API)."""
+        # ── On-chain ERC20 approve ────────────────────────────────
+        try:
+            from web3 import Web3
+
+            USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+            CTF_EXCHANGE = Web3.to_checksum_address("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E")
+            NEG_RISK_EXCHANGE = Web3.to_checksum_address("0xC5d563A36AE78145C45a50134d48A1215220f80a")
+            CTF_CONTRACT = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+            MAX_APPROVAL = 2**256 - 1
+
+            ERC20_ABI = [{"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+            ERC1155_ABI = [{"inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"name":"account","type":"address"},{"name":"operator","type":"address"}],"name":"isApprovedForAll","outputs":[{"name":"","type":"bool"}],"stateMutability":"view","type":"function"}]
+
+            w3 = Web3(Web3.HTTPProvider(Config.POLYGON_RPC_URL, request_kwargs={"timeout": 30}))
+            try:
+                block = w3.eth.block_number
+                log.info(f"Web3 connected to Polygon (block {block})")
+            except Exception as rpc_err:
+                log.error(f"Web3 not connected — skipping on-chain approvals: {rpc_err}")
+                block = None
+
+            if block:
+                account = w3.eth.account.from_key(Config.PRIVATE_KEY)
+                usdc = w3.eth.contract(address=USDC_ADDRESS, abi=ERC20_ABI)
+                ctf = w3.eth.contract(address=CTF_CONTRACT, abi=ERC1155_ABI)
+
+                NEG_RISK_ADAPTER = Web3.to_checksum_address("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
+
+                spenders = [
+                    ("CTF Exchange", CTF_EXCHANGE),
+                    ("NegRisk Exchange", NEG_RISK_EXCHANGE),
+                    ("NegRisk Adapter", NEG_RISK_ADAPTER),
+                ]
+                for label, spender in spenders:
+                    # USDC approval
+                    current = usdc.functions.allowance(account.address, spender).call()
+                    if current < 10**9:  # less than 1000 USDC (6 decimals)
+                        log.info(f"Setting USDC approval for {label} ({spender[:10]}...)...")
+                        tx = usdc.functions.approve(spender, MAX_APPROVAL).build_transaction({
+                            "from": account.address,
+                            "nonce": w3.eth.get_transaction_count(account.address),
+                            "gas": 80_000,
+                            "gasPrice": w3.eth.gas_price,
+                            "chainId": 137,
+                        })
+                        signed = account.sign_transaction(tx)
+                        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                        log.info(f"USDC approved for {label}: tx {tx_hash.hex()} (status={receipt['status']})")
+                    else:
+                        log.info(f"USDC already approved for {label} (allowance={current})")
+
+                    # ERC1155 conditional token approval
+                    is_approved = ctf.functions.isApprovedForAll(account.address, spender).call()
+                    if not is_approved:
+                        log.info(f"Setting ERC1155 approval for {label}...")
+                        tx = ctf.functions.setApprovalForAll(spender, True).build_transaction({
+                            "from": account.address,
+                            "nonce": w3.eth.get_transaction_count(account.address),
+                            "gas": 80_000,
+                            "gasPrice": w3.eth.gas_price,
+                            "chainId": 137,
+                        })
+                        signed = account.sign_transaction(tx)
+                        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                        log.info(f"ERC1155 approved for {label}: tx {tx_hash.hex()} (status={receipt['status']})")
+                    else:
+                        log.info(f"ERC1155 already approved for {label}")
+
+        except Exception as e:
+            log.error(f"On-chain approval failed: {e}", exc_info=True)
+
+        # ── CLOB API allowance update ─────────────────────────────
         try:
             collateral_params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             resp = client.update_balance_allowance(collateral_params)
-            log.info(f"USDC allowance set: {resp}")
+            log.info(f"CLOB allowance update: {resp}")
         except Exception as e:
-            log.error(f"Failed to set USDC allowance: {e}")
+            log.error(f"CLOB allowance update failed: {e}")
+
+    # ── ON-CHAIN BALANCE ─────────────────────────────────────
+
+    def _get_onchain_balance(self) -> float:
+        """Read actual USDC.e balance from Polygon chain."""
+        try:
+            from web3 import Web3
+            USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+            BALANCE_ABI = [{"inputs":[{"name":"account","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+
+            w3 = Web3(Web3.HTTPProvider(Config.POLYGON_RPC_URL, request_kwargs={"timeout": 10}))
+            usdc = w3.eth.contract(address=USDC_ADDRESS, abi=BALANCE_ABI)
+            wallet = Web3.to_checksum_address(Config.WALLET_ADDRESS)
+            raw = usdc.functions.balanceOf(wallet).call()
+            return raw / 1e6  # USDC.e has 6 decimals
+        except Exception as e:
+            log.warning(f"Could not read on-chain balance: {e}")
+            return 0.0
+
+    # ── ON-CHAIN REDEMPTION ─────────────────────────────────
+
+    def _get_token_balance(self, token_id: str) -> int:
+        """Get ERC1155 conditional token balance for a specific token_id."""
+        try:
+            from web3 import Web3
+            CTF_CONTRACT = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+            BALANCE_ABI = [{
+                "inputs": [
+                    {"name": "account", "type": "address"},
+                    {"name": "id", "type": "uint256"}
+                ],
+                "name": "balanceOf",
+                "outputs": [{"name": "", "type": "uint256"}],
+                "stateMutability": "view",
+                "type": "function"
+            }]
+
+            w3 = Web3(Web3.HTTPProvider(Config.POLYGON_RPC_URL, request_kwargs={"timeout": 10}))
+            ctf = w3.eth.contract(address=CTF_CONTRACT, abi=BALANCE_ABI)
+            wallet = Web3.to_checksum_address(Config.WALLET_ADDRESS)
+            balance = ctf.functions.balanceOf(wallet, int(token_id)).call()
+            return balance
+        except Exception as e:
+            log.warning(f"Could not read token balance for {token_id[:20]}...: {e}")
+            return 0
+
+    def _redeem_neg_risk(self, condition_id: str, position: dict) -> bool:
+        """
+        Redeem resolved position on-chain via CTF contract.
+        Calls redeemPositions on CTF (0x4D97...) to burn ERC1155 tokens -> USDC.e.
+        """
+        try:
+            from web3 import Web3
+
+            CTF_CONTRACT = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+            USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+            PARENT_COLLECTION_ID = b'\x00' * 32
+
+            REDEEM_ABI = [{
+                "name": "redeemPositions",
+                "type": "function",
+                "inputs": [
+                    {"name": "collateralToken", "type": "address"},
+                    {"name": "parentCollectionId", "type": "bytes32"},
+                    {"name": "conditionId", "type": "bytes32"},
+                    {"name": "indexSets", "type": "uint256[]"}
+                ],
+                "outputs": [],
+                "stateMutability": "nonpayable"
+            }]
+
+            w3 = Web3(Web3.HTTPProvider(Config.POLYGON_RPC_URL, request_kwargs={"timeout": 30}))
+            account = w3.eth.account.from_key(Config.PRIVATE_KEY)
+
+            # Convert condition_id to bytes32
+            cid = condition_id[2:] if condition_id.startswith("0x") else condition_id
+            cond_bytes32 = bytes.fromhex(cid).ljust(32, b'\x00')[:32]
+
+            ctf = w3.eth.contract(address=CTF_CONTRACT, abi=REDEEM_ABI)
+
+            log.info(f"Redeeming via CTF | condition: {condition_id[:16]}...")
+
+            # Use 3x network gas price to avoid dropped transactions
+            network_gas = w3.eth.gas_price
+            boosted_gas = int(network_gas * 3)
+            log.info(f"Gas price: network={network_gas} wei, using={boosted_gas} wei (3x)")
+
+            tx = ctf.functions.redeemPositions(
+                USDC_ADDRESS,
+                PARENT_COLLECTION_ID,
+                cond_bytes32,
+                [1, 2]  # indexSets for binary market (YES=1, NO=2)
+            ).build_transaction({
+                "from": account.address,
+                "nonce": w3.eth.get_transaction_count(account.address),
+                "gas": 300_000,
+                "gasPrice": boosted_gas,
+                "chainId": 137,
+            })
+            signed = account.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+            if receipt['status'] == 1:
+                log.info(f"[REDEEM SUCCESS] CTF position redeemed | tx: {tx_hash.hex()}")
+                return True
+            else:
+                log.error(f"[REDEEM FAILED] tx reverted: {tx_hash.hex()}")
+                return False
+
+        except Exception as e:
+            log.error(f"CTF redemption failed for {condition_id[:16]}...: {e}", exc_info=True)
+            return False
+
+    def _sync_onchain_balance(self):
+        """Re-read on-chain USDC.e balance and update internal state."""
+        onchain_bal = self._get_onchain_balance()
+        if onchain_bal > 0:
+            old_bal = self.balance
+            self.balance = onchain_bal
+            if abs(old_bal - onchain_bal) > 0.01:
+                log.info(f"Balance synced: ${old_bal:.2f} -> ${onchain_bal:.2f} (on-chain)")
+            self._save_state()
 
     # ── STATE PERSISTENCE ────────────────────────────────────
 
@@ -133,6 +353,9 @@ class LiveExecutor:
                     self.trade_history = json.load(f)
             except Exception as e:
                 log.error(f"Failed to load trade history: {e}")
+
+        # Always save initial state so dashboard has data files to read
+        self._save_state()
 
     def _save_state(self):
         """Persist live trading state to disk."""
@@ -236,34 +459,55 @@ class LiveExecutor:
             return {"success": False, "reason": "Could not resolve token_id"}
 
         # Get fresh price and check slippage
-        prices = await self.client.get_prices([token_id])
-        if token_id not in prices:
-            log.warning(f"No orderbook/price for token {token_id[:20]}... — skipping stale market")
-            return {"success": False, "reason": "No orderbook for token (market may be expired)"}
+        # For BTC sniper signals, the signal's market_price comes from Gamma API
+        # and is reliable. The CLOB /book endpoint returns extreme resting orders
+        # ($0.01/$0.99) for 5-min markets, making orderbook-based slippage checks
+        # falsely reject every trade. Trust the signal price for btc_sniper.
+        is_sniper = signal.get("source") == "btc_sniper"
 
-        live_price = prices[token_id]
-        if market_price > 0:
-            slippage = abs(live_price - market_price) / market_price * 100
-            if slippage > Config.MAX_SLIPPAGE_PCT:
-                log.warning(
-                    f"Slippage {slippage:.1f}% exceeds max {Config.MAX_SLIPPAGE_PCT}% "
-                    f"(signal: ${market_price:.4f}, live: ${live_price:.4f})"
-                )
-                return {"success": False, "reason": f"Slippage {slippage:.1f}% exceeds max"}
-        market_price = live_price
+        if is_sniper and market_price > 0:
+            # BTC sniper fetched actual CLOB book asks at T-120s — price is real
+            log.info(f"BTC sniper signal — using book price ${market_price:.4f} (skipping slippage check)")
+        else:
+            # For other sources, verify against CLOB orderbook
+            prices = await self.client.get_prices([token_id])
+            if token_id not in prices:
+                log.warning(f"No orderbook/price for token {token_id[:20]}... — skipping stale market")
+                return {"success": False, "reason": "No orderbook for token (market may be expired)"}
+
+            live_price = prices[token_id]
+            if market_price > 0:
+                slippage = abs(live_price - market_price) / market_price * 100
+                if slippage > Config.MAX_SLIPPAGE_PCT:
+                    log.warning(
+                        f"Slippage {slippage:.1f}% exceeds max {Config.MAX_SLIPPAGE_PCT}% "
+                        f"(signal: ${market_price:.4f}, live: ${live_price:.4f})"
+                    )
+                    return {"success": False, "reason": f"Slippage {slippage:.1f}% exceeds max"}
+            market_price = live_price
 
         if not market_price or market_price <= 0:
             return {"success": False, "reason": "No valid price available"}
 
-        # Price bounds
-        if market_price < 0.05:
+        # Price bounds (wide for 5-min markets)
+        if market_price < 0.01:
             return {"success": False, "reason": f"Price too low ({market_price:.4f})"}
-        if market_price > 0.97:
+        if market_price > 0.99:
             return {"success": False, "reason": f"Price too high ({market_price:.4f})"}
         if market_price >= 1:
             return {"success": False, "reason": f"Invalid price: {market_price}"}
 
         shares = size_usdc / market_price
+
+        # For sniper signals, cap shares by available liquidity on the book
+        if is_sniper:
+            avail = signal.get("_available_shares", 0)
+            if avail > 0 and shares > avail:
+                log.info(
+                    f"Capping order from {shares:.0f} to {avail:.0f} shares "
+                    f"(available liquidity)"
+                )
+                shares = avail
 
         # Ensure conditional token allowance is set for this token
         try:
@@ -276,47 +520,146 @@ class LiveExecutor:
             log.warning(f"Conditional token allowance update failed (may already be set): {e}")
 
         try:
-            order_type = Config.ORDER_TYPE.upper()
+            # Round price to nearest tick (0.01) for CLOB compatibility
+            order_price = round(market_price, 2)
+            # CLOB requires maker_amount (size*price for BUY) max 2 decimal places.
+            # Use whole shares so maker_amount = int * 0.xx always has ≤ 2 decimals.
+            import math
+            order_shares = float(math.floor(shares))  # whole shares only
+            if order_shares < 5:
+                order_shares = 5.0  # CLOB minimum
 
-            if order_type == "FOK":
-                # Market order: Fill-Or-Kill
-                mo = MarketOrderArgs(
-                    token_id=token_id,
-                    amount=size_usdc,
-                    side=BUY,
-                )
-                signed_order = self.clob_client.create_market_order(mo)
-                resp = self.clob_client.post_order(signed_order, OrderType.FOK)
+            import time
 
-            elif order_type == "GTC":
-                # Limit order: Good-Til-Cancelled
-                order_args = OrderArgs(
-                    price=round(market_price, 2),
-                    size=round(shares, 2),
-                    side=BUY,
+            if is_sniper:
+                # BTC sniper: Use FAK (Fill-And-Kill) to sweep asks immediately.
+                # At T-120s there IS real liquidity on the book ($0.60-$0.85 asks).
+                # FAK fills whatever is available at our price and cancels the rest.
+                # Then poll for on-chain settlement (may take a few seconds).
+                log.info(
+                    f"Placing FAK order: {order_shares} shares @ ${order_price} "
+                    f"= ${order_price * order_shares:.2f}"
                 )
-                signed_order = self.clob_client.create_and_post_order(
-                    self.clob_client.create_order({
-                        "token_id": token_id,
-                        "price": round(market_price, 2),
-                        "size": round(shares, 2),
-                        "side": BUY,
-                    })
+
+                pre_balance = self._get_token_balance(token_id)
+
+                signed_order = self.clob_client.create_order(
+                    OrderArgs(
+                        price=order_price,
+                        size=order_shares,
+                        side=BUY,
+                        token_id=token_id,
+                    )
                 )
-                resp = signed_order  # create_and_post_order returns the response
+                resp = self.clob_client.post_order(signed_order, OrderType.FAK)
+
+                if not resp or not resp.get("success", False):
+                    error_msg = resp.get("errorMsg", "Unknown error") if resp else "No response"
+                    log.error(f"FAK order rejected: {error_msg}")
+                    await self._send_notification(f"ORDER REJECTED (FAK): {error_msg}")
+                    return {"success": False, "reason": f"FAK rejected: {error_msg}"}
+
+                order_id = resp.get("orderID", resp.get("orderId", ""))
+                log.info(f"FAK order accepted: {order_id[:20]}... — checking fill...")
+
+                # FAK fills immediately, but on-chain settlement takes a few seconds.
+                # Poll every 2s for up to 10s to catch the settlement.
+                actual_shares = 0
+                for check_num in range(5):  # 5 checks x 2s = 10s max
+                    time.sleep(2)
+                    post_balance = self._get_token_balance(token_id)
+                    actual_shares_raw = post_balance - pre_balance
+                    actual_shares = actual_shares_raw / 1e6
+                    if actual_shares > 0:
+                        log.info(
+                            f"Fill confirmed after {(check_num+1)*2}s: "
+                            f"{actual_shares:.2f} shares"
+                        )
+                        break
+
+                if actual_shares <= 0:
+                    log.warning(
+                        f"FAK order: 0 shares settled on-chain after 10s "
+                        f"(pre={pre_balance}, post={post_balance})"
+                    )
+                    return {"success": False, "reason": "0 shares settled on-chain (FAK)"}
+
             else:
-                return {"success": False, "reason": f"Unknown order type: {order_type}"}
+                # Non-sniper: Use GTC limit order with on-chain verification
+                log.info(
+                    f"Placing GTC order: {order_shares} shares @ ${order_price} "
+                    f"= ${order_price * order_shares:.2f}"
+                )
 
-            # Check response
-            if not resp or not resp.get("success", False):
-                error_msg = resp.get("errorMsg", "Unknown error") if resp else "No response"
-                log.error(f"Order rejected by CLOB: {error_msg}")
-                await self._send_notification(f"ORDER REJECTED: {error_msg}")
-                return {"success": False, "reason": f"CLOB rejected: {error_msg}"}
+                pre_balance = self._get_token_balance(token_id)
 
-            order_id = resp.get("orderID", resp.get("orderId", ""))
+                signed_order = self.clob_client.create_order(
+                    OrderArgs(
+                        price=order_price,
+                        size=order_shares,
+                        side=BUY,
+                        token_id=token_id,
+                    )
+                )
+                resp = self.clob_client.post_order(signed_order, OrderType.GTC)
 
-            # Record the trade
+                if not resp or not resp.get("success", False):
+                    error_msg = resp.get("errorMsg", "Unknown error") if resp else "No response"
+                    log.error(f"Order rejected by CLOB: {error_msg}")
+                    await self._send_notification(f"ORDER REJECTED: {error_msg}")
+                    return {"success": False, "reason": f"CLOB rejected: {error_msg}"}
+
+                order_id = resp.get("orderID", resp.get("orderId", ""))
+
+                time.sleep(2)
+                post_balance = self._get_token_balance(token_id)
+                actual_shares_raw = post_balance - pre_balance
+                actual_shares = actual_shares_raw / 1e6
+
+                if actual_shares <= 0:
+                    log.warning(
+                        f"GTC order accepted but 0 shares filled "
+                        f"(pre={pre_balance}, post={post_balance}) — treating as failed"
+                    )
+                    try:
+                        self.clob_client.cancel(order_id)
+                        log.info(f"Cancelled unfilled GTC order {order_id[:16]}...")
+                    except Exception:
+                        pass
+                    return {"success": False, "reason": "0 shares filled"}
+
+            # Sanity check: if on-chain reports more shares than we ordered,
+            # cap to ordered amount. FAK can sweep extra cheap asks, inflating
+            # the fill beyond our intended bet size.
+            if actual_shares > order_shares * 1.05:
+                log.warning(
+                    f"Fill sanity check: on-chain says {actual_shares:.2f} shares "
+                    f"but we only ordered {order_shares:.0f}. Capping to ordered amount. "
+                    f"(pre={pre_balance}, post={post_balance})"
+                )
+                actual_shares = order_shares
+
+            # Calculate actual cost based on real fill, capped to intended bet size
+            actual_cost = actual_shares * market_price
+            if actual_cost > size_usdc:
+                log.info(f"Capping recorded cost from ${actual_cost:.2f} to ${size_usdc:.2f} (intended bet)")
+                actual_cost = size_usdc
+            fill_pct = (actual_shares / shares) * 100 if shares > 0 else 0
+
+            log.info(
+                f"Fill verified: requested {shares:.2f} shares, got {actual_shares:.2f} "
+                f"({fill_pct:.0f}% fill) | actual cost: ${actual_cost:.2f}"
+            )
+
+            # If partial fill on GTC, cancel the remaining resting order
+            if not is_sniper and actual_shares < shares * 0.95:
+                try:
+                    self.clob_client.cancel(order_id)
+                    log.info(f"Cancelled remaining GTC order after partial fill")
+                except Exception:
+                    pass
+
+            # Record the trade with ACTUAL fill amounts
             trade = {
                 "id": f"live_{len(self.trade_history) + 1}",
                 "order_id": order_id,
@@ -328,8 +671,8 @@ class LiveExecutor:
                 "entry_price": market_price,
                 "price": market_price,
                 "current_price": market_price,
-                "shares": round(shares, 4),
-                "size_usdc": round(size_usdc, 2),
+                "shares": round(actual_shares, 4),
+                "size_usdc": round(actual_cost, 2),
                 "source": signal.get("source", ""),
                 "signal_type": signal.get("type", ""),
                 "confidence": signal.get("confidence", 0),
@@ -339,9 +682,13 @@ class LiveExecutor:
                 "pnl_pct": 0.0,
                 "peak_pnl_pct": 0.0,
                 "exit_reason": "",
+                "requested_shares": round(shares, 4),
+                "requested_size_usdc": round(size_usdc, 2),
+                "fill_pct": round(fill_pct, 1),
             }
 
-            self.balance -= size_usdc
+            # Sync balance with on-chain (most accurate)
+            self._sync_onchain_balance()
             self.positions.append(trade)
             self.trade_history.append(trade)
             self._save_state()
@@ -408,15 +755,54 @@ class LiveExecutor:
             log.warning(f"Sell allowance update failed (may already be set): {e}")
 
         try:
-            # For resolved markets, shares are auto-redeemed. No sell order needed.
+            # For resolved markets, redeem on-chain to convert ERC1155 -> USDC.e
             if "resolved" in reason.lower():
-                log.info(f"Market resolved — shares auto-redeemed, no sell order needed")
+                condition_id = position.get("condition_id", "")
+                if not condition_id:
+                    log.warning(f"No condition_id — cannot redeem on-chain")
+                    return {"success": False, "reason": "No condition_id for redemption"}
+
+                # Read balance BEFORE redemption to measure real P&L
+                balance_before = self._get_onchain_balance()
+                log.info(
+                    f"Market resolved — redeeming ERC1155 tokens on-chain... "
+                    f"(balance before: ${balance_before:.2f})"
+                )
+
+                redeemed = self._redeem_neg_risk(condition_id, position)
+                if not redeemed:
+                    log.error(
+                        f"On-chain redemption FAILED — keeping position open for retry | "
+                        f"token: {token_id[:20]}..."
+                    )
+                    # DO NOT mark as sold — keep open so check_exits retries next cycle
+                    return {"success": False, "reason": "Redemption failed, will retry"}
+
+                # Wait for on-chain state to settle, then read balance AFTER
+                import time
+                time.sleep(3)
+                balance_after = self._get_onchain_balance()
+                real_proceeds = balance_after - balance_before
+                cost = position["size_usdc"]
+                profit = real_proceeds - cost
+                pnl_pct = (real_proceeds / cost - 1) * 100 if cost > 0 else 0
+
+                log.info(
+                    f"[REDEEM VERIFIED] Balance: ${balance_before:.2f} -> ${balance_after:.2f} | "
+                    f"Real proceeds: ${real_proceeds:.2f} | Cost: ${cost:.2f} | "
+                    f"Real P&L: ${profit:+.2f}"
+                )
+
+                # Update balance from on-chain (single source of truth)
+                self.balance = balance_after
+
             else:
-                # Place sell order on CLOB
-                if Config.ORDER_TYPE.upper() == "FOK":
+                # Place sell order on CLOB (non-resolved markets)
+                if getattr(Config, "ORDER_TYPE", "FOK").upper() == "FOK":
                     mo = MarketOrderArgs(
                         token_id=token_id,
                         amount=shares,
+                        side=SELL,
                     )
                     signed = self.clob_client.create_market_order(mo)
                     resp = self.clob_client.post_order(signed, OrderType.FOK)
@@ -437,17 +823,18 @@ class LiveExecutor:
                 if not resp or not resp.get("success", False):
                     error_msg = resp.get("errorMsg", "Unknown") if resp else "No response"
                     log.error(f"Sell order failed: {error_msg}")
-                    # Don't return failure for resolved markets - redemption happens on-chain
-                    if "resolved" not in reason.lower():
-                        return {"success": False, "reason": error_msg}
+                    return {"success": False, "reason": error_msg}
 
-            # Calculate P&L
-            proceeds = shares * current_price
-            cost = position["size_usdc"]
-            profit = proceeds - cost
-            pnl_pct = (current_price / position["entry_price"] - 1) * 100 if position["entry_price"] > 0 else 0
+                # For CLOB sells, use theoretical P&L (no on-chain redemption)
+                proceeds = shares * current_price
+                cost = position["size_usdc"]
+                profit = proceeds - cost
+                pnl_pct = (current_price / position["entry_price"] - 1) * 100 if position["entry_price"] > 0 else 0
 
-            # Update position
+                # Return capital
+                self.balance += proceeds
+
+            # Update position (only reached if exit was successful)
             position["status"] = "sold"
             position["exit_price"] = current_price
             position["exit_reason"] = reason
@@ -455,8 +842,6 @@ class LiveExecutor:
             position["pnl_pct"] = round(pnl_pct, 2)
             position["closed_at"] = datetime.now(timezone.utc).isoformat()
 
-            # Return capital
-            self.balance += proceeds
             self.total_pnl += profit
             self.daily_loss += profit  # negative profit = loss
 

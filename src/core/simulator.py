@@ -108,12 +108,15 @@ class PaperTrader:
         token_id = signal.get("token_id", "")
         market_price = signal.get("market_price", 0)
         outcome = signal.get("recommended_outcome", signal.get("outcome", ""))
+        source = signal.get("source", "")
 
         # CRITICAL: Resolve token_id if missing - needed for live price tracking
         if not token_id and signal.get("condition_id"):
             token_id = await self._resolve_token_id(signal["condition_id"], outcome)
 
-        if token_id:
+        # For btc_sniper signals, trust the CLOB orderbook price from the signal
+        # (it was fetched at the exact moment of signal generation)
+        if source != "btc_sniper" and token_id:
             prices = await self.client.get_prices([token_id])
             if token_id in prices:
                 market_price = prices[token_id]
@@ -133,6 +136,13 @@ class PaperTrader:
             return {"success": False, "reason": f"Invalid price: {market_price}"}
 
         shares = size_usdc / market_price
+
+        # Cap shares to available orderbook depth (btc_sniper provides this)
+        available = signal.get("_available_shares")
+        if available and shares > available:
+            shares = available
+            size_usdc = shares * market_price
+            log.info(f"Capped shares to orderbook depth: {shares:.0f} @ ${market_price:.4f} = ${size_usdc:.2f}")
 
         trade = {
             "id": f"sim_{len(self.trade_history) + 1}",
